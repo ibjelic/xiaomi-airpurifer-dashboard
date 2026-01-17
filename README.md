@@ -25,26 +25,67 @@ A beautiful web dashboard for controlling your Xiaomi Air Purifier (zhimi.airp.r
 ## Setup
 
 **IMPORTANT: Python Version Requirement**
-- This app requires **Python 3.11 or 3.12** (Python 3.14 has compatibility issues with python-miio)
-- If you're using Python 3.14, please install Python 3.11 or 3.12 and create a new virtual environment
+- This app requires **Python 3.9, 3.10, 3.11, or 3.12**
+- Python 3.13+ has compatibility issues with python-miio
+
+### Automated Setup (Recommended - Linux)
+
+Use the provided setup script for automatic installation and systemd service setup:
+
+```bash
+# Make script executable (first time only)
+chmod +x setup.sh
+
+# Full installation (creates venv, installs requirements, sets up service)
+./setup.sh install
+
+# Check current status
+./setup.sh status
+
+# Start the service
+./setup.sh start
+```
+
+#### Setup Script Commands
+
+| Command | Description |
+|---------|-------------|
+| `./setup.sh install` | Full installation (venv + requirements + service) |
+| `./setup.sh refresh` | Force recreate venv and reinstall requirements |
+| `./setup.sh service` | Setup/refresh systemd service only |
+| `./setup.sh start` | Start the service |
+| `./setup.sh stop` | Stop the service |
+| `./setup.sh restart` | Restart the service |
+| `./setup.sh status` | Show current status of everything |
+| `./setup.sh uninstall` | Remove service (keeps venv) |
+| `./setup.sh help` | Show help message |
+
+**Options:**
+- `--force` - Force recreate even if valid (e.g., `./setup.sh install --force`)
+
+**View logs:**
+```bash
+journalctl -u xiaomi-airpurifier-dashboard -f
+```
+
+### Manual Setup
 
 1. **Create a virtual environment (if not already done):**
    ```bash
-   python3.11 -m venv venv
-   # or
-   python3.12 -m venv venv
+   python3.12 -m venv .venv
+   # or use python3.11, python3.10, python3.9
    ```
 
 2. **Activate the virtual environment:**
    ```bash
    # Windows PowerShell
-   .\venv\Scripts\Activate.ps1
-   
+   .\.venv\Scripts\Activate.ps1
+
    # Windows CMD
-   venv\Scripts\activate.bat
-   
+   .venv\Scripts\activate.bat
+
    # Linux/Mac
-   source venv/bin/activate
+   source .venv/bin/activate
    ```
 
 3. **Install dependencies:**
@@ -52,7 +93,7 @@ A beautiful web dashboard for controlling your Xiaomi Air Purifier (zhimi.airp.r
    pip install -r requirements.txt
    ```
 
-2. **Configure your device:**
+4. **Configure your device:**
    - Copy `.env.example` to `.env`
    - Fill in your device IP and token:
      ```bash
@@ -62,17 +103,17 @@ A beautiful web dashboard for controlling your Xiaomi Air Purifier (zhimi.airp.r
      - `MIIO_IP`: Your air purifier's local IP address
      - `MIIO_TOKEN`: Your device token (get from Mi Home app or use `miio discover`)
 
-3. **Get your device token:**
+5. **Get your device token:**
    - Use the Mi Home app to get the token
    - Or use `miio discover` command (if you have python-miio installed)
    - Or use tools like `miio-extract-tokens` from Home Assistant
 
-4. **Run the application:**
+6. **Run the application:**
    ```bash
    python app.py
    ```
 
-5. **Access the dashboard:**
+7. **Access the dashboard:**
    - Open your browser to `http://localhost:5000`
    - The dashboard will automatically update every 5 seconds
 
@@ -119,7 +160,7 @@ Edit `.env` to customize:
 
 ## Requirements
 
-- **Python 3.11 or 3.12** (Python 3.14 is NOT compatible due to pydantic v1 issues)
+- **Python 3.9, 3.10, 3.11, or 3.12** (Python 3.13+ is NOT compatible due to pydantic v1 issues)
 - Flask 3.0.3
 - python-miio (latest from git)
 - python-dotenv 1.0.0
