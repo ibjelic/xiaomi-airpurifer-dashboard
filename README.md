@@ -2,6 +2,7 @@
 
 A beautiful web dashboard for controlling your Xiaomi Air Purifier (zhimi.airp.rmb1) with custom curve support.
 
+<img width="3413" height="1268" alt="image" src="https://github.com/user-attachments/assets/09f62563-c9c5-4cc9-b237-b2951fa3cb32" />
 
 
 ## Features
