@@ -1,0 +1,1 @@
+{"mode": "auto", "auto_max_percent": 60, "auto_curve_type": "logarithmic", "constant_percent": 50, "current_curve": [[0, 10], [50, 20], [100, 30], [150, 40], [200, 45], [300, 50], [400, 55], [600, 60]], "current_curve_name": "Silent", "selected_curve_name": "Silent", "curve_smooth": "smooth"}
