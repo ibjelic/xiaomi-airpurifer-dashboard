@@ -12,7 +12,7 @@ from collections import deque
 
 import requests
 from dotenv import load_dotenv
-from flask import Flask, Response, jsonify, render_template_string, request
+from flask import Flask, Response, jsonify, render_template_string, request, send_file
 
 # Import miio with better error handling for Python 3.14 compatibility
 AirPurifierMiot = None
@@ -235,6 +235,12 @@ AIR_QUALITY_LATITUDE = env_float("AIR_QUALITY_LATITUDE", 44.7866)
 AIR_QUALITY_LONGITUDE = env_float("AIR_QUALITY_LONGITUDE", 20.4489)
 AIR_QUALITY_TIMEZONE = os.getenv("AIR_QUALITY_TIMEZONE", "Europe/Belgrade").strip()
 
+# Logging configuration
+MIN_LOG_INTERVAL = env_int("MIN_LOG_INTERVAL", 10)
+MAX_ROWS_PER_FILE = env_int("MAX_ROWS_PER_FILE", 600000)
+LOG_ENABLED_DEFAULT = os.getenv("LOG_ENABLED_DEFAULT", "false").lower() == "true"
+LOGS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
+
 if not MIIO_IP or not MIIO_TOKEN:
     raise SystemExit("MIIO_IP and MIIO_TOKEN are required in .env file")
 
@@ -287,6 +293,16 @@ def load_state():
                         state["curve_smooth"] = saved["curve_smooth"]
                     if "selected_curve_name" in saved:
                         state["selected_curve_name"] = saved["selected_curve_name"]
+                    if "logging_enabled" in saved:
+                        state["logging_enabled"] = saved["logging_enabled"]
+                    if "log_interval" in saved:
+                        state["log_interval"] = saved["log_interval"]
+                    if "temp_assist_enabled" in saved:
+                        state["temp_assist_enabled"] = saved["temp_assist_enabled"]
+                    if "temp_assist_threshold_c" in saved:
+                        state["temp_assist_threshold_c"] = saved["temp_assist_threshold_c"]
+                    if "temp_assist_reduce_percent" in saved:
+                        state["temp_assist_reduce_percent"] = saved["temp_assist_reduce_percent"]
     except Exception as e:
         print(f"Error loading state: {e}")
 
@@ -303,6 +319,11 @@ def save_state():
                 "current_curve_name": state["current_curve_name"],
                 "selected_curve_name": state.get("selected_curve_name", "Silent"),
                 "curve_smooth": state["curve_smooth"],
+                "logging_enabled": state.get("logging_enabled", LOG_ENABLED_DEFAULT),
+                "log_interval": state.get("log_interval", MIN_LOG_INTERVAL),
+                "temp_assist_enabled": state.get("temp_assist_enabled", False),
+                "temp_assist_threshold_c": state.get("temp_assist_threshold_c", 18.0),
+                "temp_assist_reduce_percent": state.get("temp_assist_reduce_percent", 10),
             }
         with open(STATE_FILE, 'w') as f:
             json.dump(to_save, f)
@@ -349,6 +370,11 @@ state = {
     "last_update": None,
     "last_mode_change": None,
     "mode_change_in_progress": False,
+    "logging_enabled": LOG_ENABLED_DEFAULT,
+    "log_interval": MIN_LOG_INTERVAL,
+    "temp_assist_enabled": False,
+    "temp_assist_threshold_c": 18.0,
+    "temp_assist_reduce_percent": 10,
 }
 
 # Load saved state on startup
@@ -387,6 +413,388 @@ create_predefined_curves()
 
 # Selected curve for curve mode
 selected_curve_name = "Silent"  # Default to Silent
+
+
+class LogManager:
+    """Thread-safe CSV logging manager with file rotation"""
+
+    VARIABLE_TYPES = ["aqi", "temperature", "humidity", "fan_speed", "outside_aqi", "outside_temp"]
+
+    def __init__(self, logs_dir: str, max_rows: int = 600000):
+        self.logs_dir = logs_dir
+        self.max_rows = max_rows
+        self.locks = {vtype: threading.Lock() for vtype in self.VARIABLE_TYPES}
+        self.row_counts = {vtype: 0 for vtype in self.VARIABLE_TYPES}
+        self.current_files = {vtype: None for vtype in self.VARIABLE_TYPES}
+        # Note: directories are created on-demand when logging starts
+
+    def _ensure_directories(self):
+        """Create log directories if they don't exist"""
+        for vtype in self.VARIABLE_TYPES:
+            dir_path = os.path.join(self.logs_dir, vtype)
+            os.makedirs(dir_path, exist_ok=True)
+
+    def _get_current_file(self, variable_type: str) -> str:
+        """Get or create the current log file for a variable type"""
+        dir_path = os.path.join(self.logs_dir, variable_type)
+
+        # Find existing files
+        existing_files = sorted([
+            f for f in os.listdir(dir_path)
+            if f.startswith(f"{variable_type}_") and f.endswith(".csv")
+        ])
+
+        if existing_files:
+            latest_file = os.path.join(dir_path, existing_files[-1])
+            # Count rows in the latest file
+            try:
+                with open(latest_file, 'r') as f:
+                    row_count = sum(1 for _ in f) - 1  # Subtract header
+                if row_count < self.max_rows:
+                    self.row_counts[variable_type] = row_count
+                    return latest_file
+            except:
+                pass
+
+        # Create new file
+        return self._create_new_file(variable_type)
+
+    def _create_new_file(self, variable_type: str) -> str:
+        """Create a new log file with header"""
+        timestamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"{variable_type}_{timestamp}.csv"
+        filepath = os.path.join(self.logs_dir, variable_type, filename)
+
+        with open(filepath, 'w') as f:
+            f.write("timestamp,value\n")
+
+        self.row_counts[variable_type] = 0
+        self.current_files[variable_type] = filepath
+        return filepath
+
+    def log_value(self, variable_type: str, value: float | int | None):
+        """Log a single value to the appropriate CSV file"""
+        if variable_type not in self.VARIABLE_TYPES:
+            return False
+        if value is None:
+            return False
+
+        with self.locks[variable_type]:
+            try:
+                # Ensure directories exist
+                self._ensure_directories()
+
+                # Get current file or create new one
+                if self.current_files[variable_type] is None:
+                    self.current_files[variable_type] = self._get_current_file(variable_type)
+
+                filepath = self.current_files[variable_type]
+
+                # Check if rotation needed
+                if self.row_counts[variable_type] >= self.max_rows:
+                    filepath = self._create_new_file(variable_type)
+
+                # Write the log entry
+                timestamp = dt.datetime.now().isoformat()
+                with open(filepath, 'a') as f:
+                    f.write(f"{timestamp},{value}\n")
+
+                self.row_counts[variable_type] += 1
+                return True
+            except Exception as e:
+                logger.error(f"Error logging {variable_type}: {e}")
+                return False
+
+    def get_log_tree(self) -> dict:
+        """Get the file tree structure of all log files"""
+        tree = {}
+
+        if not os.path.exists(self.logs_dir):
+            return tree
+
+        for vtype in self.VARIABLE_TYPES:
+            dir_path = os.path.join(self.logs_dir, vtype)
+            if os.path.exists(dir_path):
+                files = []
+                for filename in sorted(os.listdir(dir_path)):
+                    if filename.endswith('.csv'):
+                        filepath = os.path.join(dir_path, filename)
+                        try:
+                            stat = os.stat(filepath)
+                            with open(filepath, 'r') as f:
+                                row_count = sum(1 for _ in f) - 1  # Subtract header
+                            files.append({
+                                "name": filename,
+                                "path": f"{vtype}/{filename}",
+                                "size": stat.st_size,
+                                "rows": max(0, row_count),
+                                "modified": dt.datetime.fromtimestamp(stat.st_mtime).isoformat()
+                            })
+                        except:
+                            continue
+                if files:
+                    tree[vtype] = files
+
+        return tree
+
+    def read_file_preview(self, relative_path: str, lines: int = 50) -> dict:
+        """Read a preview of a log file"""
+        filepath = os.path.join(self.logs_dir, relative_path)
+
+        if not os.path.exists(filepath) or not filepath.endswith('.csv'):
+            return {"error": "File not found"}
+
+        try:
+            with open(filepath, 'r') as f:
+                all_lines = f.readlines()
+
+            total_rows = len(all_lines) - 1  # Subtract header
+            header = all_lines[0].strip() if all_lines else ""
+
+            # Get last N lines (most recent data)
+            preview_lines = all_lines[-lines:] if len(all_lines) > lines else all_lines[1:]
+
+            return {
+                "header": header,
+                "preview": [line.strip() for line in preview_lines],
+                "total_rows": total_rows,
+                "showing": len(preview_lines)
+            }
+        except Exception as e:
+            return {"error": str(e)}
+
+    def get_file_path(self, relative_path: str) -> str | None:
+        """Get absolute path to a log file for download"""
+        filepath = os.path.join(self.logs_dir, relative_path)
+        if os.path.exists(filepath) and filepath.endswith('.csv'):
+            return filepath
+        return None
+
+    def read_logs_for_analysis(self, variable_type: str, hours: int = 48) -> list:
+        """Read log data for analysis within the specified time range"""
+        if variable_type not in self.VARIABLE_TYPES:
+            return []
+
+        dir_path = os.path.join(self.logs_dir, variable_type)
+        if not os.path.exists(dir_path):
+            return []
+
+        cutoff = dt.datetime.now() - dt.timedelta(hours=hours)
+        data = []
+
+        for filename in sorted(os.listdir(dir_path)):
+            if not filename.endswith('.csv'):
+                continue
+
+            filepath = os.path.join(dir_path, filename)
+            try:
+                with open(filepath, 'r') as f:
+                    next(f)  # Skip header
+                    for line in f:
+                        parts = line.strip().split(',')
+                        if len(parts) >= 2:
+                            try:
+                                timestamp = dt.datetime.fromisoformat(parts[0])
+                                if timestamp >= cutoff:
+                                    value = float(parts[1])
+                                    data.append({
+                                        "timestamp": timestamp,
+                                        "value": value
+                                    })
+                            except (ValueError, TypeError):
+                                continue
+            except:
+                continue
+
+        return sorted(data, key=lambda x: x["timestamp"])
+
+    def get_data_range(self) -> dict:
+        """Get information about available data ranges"""
+        result = {}
+
+        for vtype in self.VARIABLE_TYPES:
+            dir_path = os.path.join(self.logs_dir, vtype)
+            if not os.path.exists(dir_path):
+                result[vtype] = {"hours": 0, "rows": 0}
+                continue
+
+            oldest = None
+            newest = None
+            total_rows = 0
+
+            for filename in os.listdir(dir_path):
+                if not filename.endswith('.csv'):
+                    continue
+
+                filepath = os.path.join(dir_path, filename)
+                try:
+                    with open(filepath, 'r') as f:
+                        lines = f.readlines()
+
+                    if len(lines) < 2:
+                        continue
+
+                    total_rows += len(lines) - 1
+
+                    # Get first and last timestamps
+                    first_line = lines[1].strip().split(',')
+                    last_line = lines[-1].strip().split(',')
+
+                    if first_line:
+                        try:
+                            ts = dt.datetime.fromisoformat(first_line[0])
+                            if oldest is None or ts < oldest:
+                                oldest = ts
+                        except:
+                            pass
+
+                    if last_line:
+                        try:
+                            ts = dt.datetime.fromisoformat(last_line[0])
+                            if newest is None or ts > newest:
+                                newest = ts
+                        except:
+                            pass
+                except:
+                    continue
+
+            hours = 0
+            if oldest and newest:
+                hours = (newest - oldest).total_seconds() / 3600
+
+            result[vtype] = {
+                "hours": round(hours, 1),
+                "rows": total_rows,
+                "oldest": oldest.isoformat() if oldest else None,
+                "newest": newest.isoformat() if newest else None
+            }
+
+        return result
+
+
+class AnalysisEngine:
+    """Engine for generating optimized curves from historical log data"""
+
+    def __init__(self, log_manager: LogManager):
+        self.log_manager = log_manager
+
+    def get_available_data_range(self) -> dict:
+        """Check how much logged data exists"""
+        return self.log_manager.get_data_range()
+
+    def generate_curve(self, hours: int = 48, include_outside_aqi: bool = False,
+                      max_cutoff: float = 1.0, weekdays: list = None) -> dict:
+        """Generate an optimized AQI->fan_speed curve from historical data
+
+        Args:
+            hours: Number of hours of data to analyze
+            include_outside_aqi: Whether to factor in outside AQI
+            max_cutoff: Maximum percentile cutoff (0.2-1.0 for 20%-100%)
+            weekdays: List of weekdays to include (0=Monday, 6=Sunday), None for all
+
+        Returns:
+            dict with curve points and metadata
+        """
+        # Read AQI and fan_speed data
+        aqi_data = self.log_manager.read_logs_for_analysis("aqi", hours)
+        fan_data = self.log_manager.read_logs_for_analysis("fan_speed", hours)
+
+        if len(aqi_data) < 10 or len(fan_data) < 10:
+            return {"error": "Insufficient data", "aqi_points": len(aqi_data), "fan_points": len(fan_data)}
+
+        # Filter by weekdays if specified
+        if weekdays is not None:
+            aqi_data = [d for d in aqi_data if d["timestamp"].weekday() in weekdays]
+            fan_data = [d for d in fan_data if d["timestamp"].weekday() in weekdays]
+
+        if len(aqi_data) < 10 or len(fan_data) < 10:
+            return {"error": "Insufficient data for selected weekdays"}
+
+        # Align data by timestamp (within 30 second tolerance)
+        aligned_data = []
+        fan_index = 0
+
+        for aqi_point in aqi_data:
+            while fan_index < len(fan_data) - 1:
+                time_diff = abs((fan_data[fan_index]["timestamp"] - aqi_point["timestamp"]).total_seconds())
+                next_diff = abs((fan_data[fan_index + 1]["timestamp"] - aqi_point["timestamp"]).total_seconds())
+
+                if next_diff < time_diff:
+                    fan_index += 1
+                else:
+                    break
+
+            if fan_index < len(fan_data):
+                time_diff = abs((fan_data[fan_index]["timestamp"] - aqi_point["timestamp"]).total_seconds())
+                if time_diff <= 30:
+                    aligned_data.append({
+                        "aqi": aqi_point["value"],
+                        "fan_speed": fan_data[fan_index]["value"],
+                        "timestamp": aqi_point["timestamp"]
+                    })
+
+        if len(aligned_data) < 10:
+            return {"error": "Could not align enough data points"}
+
+        # Optionally factor in outside AQI
+        if include_outside_aqi:
+            outside_data = self.log_manager.read_logs_for_analysis("outside_aqi", hours)
+            # This would add complexity weighting - simplified for now
+
+        # Group by AQI buckets and compute average fan speed
+        buckets = {}
+        aqi_thresholds = [0, 25, 50, 75, 100, 125, 150, 200, 250, 300, 400, 500, 600]
+
+        for point in aligned_data:
+            aqi = point["aqi"]
+            fan = point["fan_speed"]
+
+            # Find bucket
+            bucket = 0
+            for threshold in aqi_thresholds:
+                if aqi >= threshold:
+                    bucket = threshold
+                else:
+                    break
+
+            if bucket not in buckets:
+                buckets[bucket] = []
+            buckets[bucket].append(fan)
+
+        # Calculate curve points with cutoff
+        curve_points = []
+        for aqi_value in sorted(buckets.keys()):
+            speeds = sorted(buckets[aqi_value])
+            if speeds:
+                # Use percentile based on cutoff
+                cutoff_index = int(len(speeds) * max_cutoff) - 1
+                cutoff_index = max(0, min(cutoff_index, len(speeds) - 1))
+                fan_speed = speeds[cutoff_index]
+                curve_points.append([aqi_value, round(fan_speed, 1)])
+
+        if len(curve_points) < 2:
+            return {"error": "Could not generate enough curve points"}
+
+        # Ensure curve is monotonically increasing (fan speed should increase with AQI)
+        for i in range(1, len(curve_points)):
+            if curve_points[i][1] < curve_points[i-1][1]:
+                curve_points[i][1] = curve_points[i-1][1]
+
+        return {
+            "success": True,
+            "curve": curve_points,
+            "data_points": len(aligned_data),
+            "hours_analyzed": hours,
+            "buckets_used": len(buckets),
+            "include_outside_aqi": include_outside_aqi,
+            "max_cutoff": max_cutoff,
+            "weekdays": weekdays
+        }
+
+
+# Initialize log manager
+log_manager = LogManager(LOGS_DIR, MAX_ROWS_PER_FILE)
+analysis_engine = AnalysisEngine(log_manager)
 
 
 def interpolate_curve(aqi: float, curve: list) -> int:
@@ -731,6 +1139,19 @@ def control_loop() -> None:
                 continue
             
             target_percent = compute_target_percent(aqi, effective_mode, auto_max, auto_curve, constant_percent, curve)
+
+            # Temperature Assist: optionally reduce fan speed when it's cold
+            try:
+                with state_lock:
+                    temp_assist_enabled = bool(state.get("temp_assist_enabled", False))
+                    temp_assist_threshold_c = state.get("temp_assist_threshold_c", 18.0)
+                    temp_assist_reduce_percent = state.get("temp_assist_reduce_percent", 10)
+
+                if temp_assist_enabled and temperature is not None:
+                    if float(temperature) < float(temp_assist_threshold_c):
+                        target_percent = max(0, min(100, int(round(target_percent - float(temp_assist_reduce_percent)))))
+            except Exception:
+                pass
             
             # All modes use favorite mode on device, just control fan speed
             # IMPORTANT: Always use apply_percent which sets device to favorite mode
@@ -791,6 +1212,58 @@ def control_loop() -> None:
             with state_lock:
                 state["last_error"] = str(exc)
         time.sleep(POLL_INTERVAL)
+
+
+def logging_loop() -> None:
+    """Background thread that logs data to CSV files"""
+    last_indoor_log = 0
+    last_outdoor_log = 0
+    outdoor_interval = 300  # 5 minutes for outdoor data
+
+    while True:
+        try:
+            with state_lock:
+                logging_enabled = state.get("logging_enabled", False)
+                log_interval = state.get("log_interval", MIN_LOG_INTERVAL)
+
+            if logging_enabled:
+                current_time = time.time()
+
+                # Log indoor values at configured interval
+                if current_time - last_indoor_log >= log_interval:
+                    with state_lock:
+                        aqi = state.get("last_aqi")
+                        temperature = state.get("last_temperature")
+                        humidity = state.get("last_humidity")
+                        fan_speed = state.get("current_percent")
+
+                    log_manager.log_value("aqi", aqi)
+                    log_manager.log_value("temperature", temperature)
+                    log_manager.log_value("humidity", humidity)
+                    log_manager.log_value("fan_speed", fan_speed)
+
+                    last_indoor_log = current_time
+
+                # Log outdoor values every 5 minutes
+                if current_time - last_outdoor_log >= outdoor_interval:
+                    try:
+                        outside_aqi_data = get_outside_aqi()
+                        if "aqi" in outside_aqi_data:
+                            log_manager.log_value("outside_aqi", outside_aqi_data["aqi"])
+
+                        # Get outside temp from weather data
+                        weather_data = get_weather("belgrade")
+                        if "current" in weather_data and "temperature" in weather_data["current"]:
+                            log_manager.log_value("outside_temp", weather_data["current"]["temperature"])
+                    except Exception as e:
+                        logger.warning(f"Error logging outdoor data: {e}")
+
+                    last_outdoor_log = current_time
+
+        except Exception as exc:
+            logger.error(f"Error in logging loop: {exc}")
+
+        time.sleep(1)  # Check every second for responsiveness
 
 
 app = Flask(__name__)
@@ -1462,6 +1935,360 @@ HTML_TEMPLATE = """
             }
         }
 
+        /* ============= Modal Overlay ============= */
+        .modal-overlay {
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: rgba(0, 0, 0, 0.75);
+            z-index: 3000;
+            display: none;
+            align-items: center;
+            justify-content: center;
+            padding: 20px;
+        }
+
+        .modal-overlay.show {
+            display: flex;
+        }
+
+        .modal-container {
+            background: var(--card);
+            border-radius: 16px;
+            max-width: 700px;
+            width: 100%;
+            max-height: 80vh;
+            overflow: hidden;
+            display: flex;
+            flex-direction: column;
+            box-shadow: var(--shadow);
+        }
+
+        .modal-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 16px 20px;
+            border-bottom: 1px solid var(--border);
+        }
+
+        .modal-title {
+            font-size: 18px;
+            font-weight: 600;
+            color: var(--ink);
+        }
+
+        .modal-close {
+            background: var(--card-alt);
+            border: 1px solid var(--border);
+            color: var(--ink);
+            width: 32px;
+            height: 32px;
+            border-radius: 8px;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 18px;
+        }
+
+        .modal-body {
+            padding: 20px;
+            overflow-y: auto;
+            flex: 1;
+        }
+
+        /* ============= Log Explorer Styles ============= */
+        .log-folder {
+            margin-bottom: 12px;
+        }
+
+        .log-folder-header {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 10px 12px;
+            background: var(--card-alt);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            cursor: pointer;
+            font-weight: 500;
+            color: var(--ink);
+        }
+
+        .log-folder-header:hover {
+            background: var(--accent-soft);
+        }
+
+        .log-folder-icon {
+            font-size: 16px;
+        }
+
+        .log-folder-name {
+            flex: 1;
+        }
+
+        .log-folder-count {
+            font-size: 12px;
+            opacity: 0.7;
+        }
+
+        .log-folder-files {
+            margin-left: 20px;
+            margin-top: 8px;
+            display: none;
+        }
+
+        .log-folder.expanded .log-folder-files {
+            display: block;
+        }
+
+        .log-file {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 8px 12px;
+            background: var(--card);
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            margin-bottom: 6px;
+        }
+
+        .log-file-icon {
+            opacity: 0.6;
+        }
+
+        .log-file-info {
+            flex: 1;
+            min-width: 0;
+        }
+
+        .log-file-name {
+            font-size: 13px;
+            font-weight: 500;
+            color: var(--ink);
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+
+        .log-file-meta {
+            font-size: 11px;
+            color: var(--muted);
+        }
+
+        .log-file-actions {
+            display: flex;
+            gap: 6px;
+        }
+
+        .log-file-btn {
+            padding: 4px 10px;
+            font-size: 11px;
+            border-radius: 4px;
+            border: 1px solid var(--border);
+            background: var(--card-alt);
+            color: var(--ink);
+            cursor: pointer;
+        }
+
+        .log-file-btn:hover {
+            background: var(--accent-soft);
+        }
+
+        .log-preview {
+            background: var(--card-alt);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 12px;
+            margin-top: 12px;
+            font-family: 'DM Mono', monospace;
+            font-size: 11px;
+            max-height: 300px;
+            overflow: auto;
+            white-space: pre;
+            color: var(--ink);
+        }
+
+        /* ============= Stylish Checkbox ============= */
+        .checkbox-stylish {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            cursor: pointer;
+            user-select: none;
+        }
+
+        .checkbox-stylish input {
+            display: none;
+        }
+
+        .checkbox-stylish .checkmark {
+            width: 20px;
+            height: 20px;
+            border: 2px solid var(--border);
+            border-radius: 6px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            transition: all 0.2s;
+            background: var(--card);
+        }
+
+        .checkbox-stylish input:checked + .checkmark {
+            background: var(--accent);
+            border-color: var(--accent);
+        }
+
+        .checkbox-stylish .checkmark::after {
+            content: "";
+            display: none;
+            width: 5px;
+            height: 10px;
+            border: solid white;
+            border-width: 0 2px 2px 0;
+            transform: rotate(45deg);
+            margin-bottom: 2px;
+        }
+
+        .checkbox-stylish input:checked + .checkmark::after {
+            display: block;
+        }
+
+        .checkbox-stylish .checkbox-label {
+            font-size: 14px;
+            color: var(--ink);
+        }
+
+        /* ============= Analysis Section ============= */
+        .analysis-status {
+            padding: 12px;
+            background: var(--card-alt);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            margin-bottom: 15px;
+        }
+
+        .analysis-status-item {
+            display: flex;
+            justify-content: space-between;
+            padding: 4px 0;
+            font-size: 13px;
+        }
+
+        .analysis-status-label {
+            color: var(--muted);
+        }
+
+        .analysis-status-value {
+            color: var(--ink);
+            font-weight: 500;
+        }
+
+        .weekday-selector {
+            display: flex;
+            gap: 6px;
+            flex-wrap: wrap;
+            margin: 10px 0;
+        }
+
+        .weekday-btn {
+            padding: 6px 12px;
+            font-size: 12px;
+            border-radius: 6px;
+            border: 1px solid var(--border);
+            background: var(--card);
+            color: var(--ink);
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+
+        .weekday-btn.active {
+            background: var(--accent);
+            border-color: var(--accent);
+            color: white;
+        }
+
+        .curve-preview-container {
+            margin-top: 15px;
+            padding: 15px;
+            background: var(--card-alt);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+        }
+
+        .curve-preview-chart {
+            height: 200px;
+            margin-bottom: 10px;
+        }
+
+        .curve-preview-info {
+            font-size: 12px;
+            color: var(--muted);
+            margin-bottom: 10px;
+        }
+
+        /* ============= Logging Section Styles ============= */
+        .logging-controls {
+            display: flex;
+            flex-direction: column;
+            gap: 15px;
+        }
+
+        .logging-toggle-row {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+        }
+
+        .logging-toggle-label {
+            font-size: 14px;
+            color: var(--ink);
+        }
+
+        .logging-interval-row {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        .logging-interval-label {
+            font-size: 13px;
+            color: var(--muted);
+            min-width: 80px;
+        }
+
+        /* ============= Temperature Assist Styles ============= */
+        .temp-assist-controls {
+            display: flex;
+            flex-direction: column;
+            gap: 15px;
+        }
+
+        .temp-assist-row {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 12px;
+            flex-wrap: wrap;
+        }
+
+        .temp-assist-row-label {
+            font-size: 13px;
+            color: var(--muted);
+            min-width: 110px;
+        }
+
+        .temp-assist-row-controls {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            flex: 1 1 auto;
+            justify-content: flex-end;
+        }
+
         /* --- Visual Refresh Overrides --- */
         :root {
             color-scheme: light;
@@ -1555,30 +2382,44 @@ HTML_TEMPLATE = """
         }
 
         .app-container {
-            display: grid;
-            grid-template-columns: minmax(0, 1.2fr) minmax(0, 0.8fr);
-            grid-auto-rows: min-content;
-            gap: 18px;
-            align-items: start;
-            height: auto;
+            display: flex;
+            flex-direction: column;
             min-height: 100vh;
-            max-width: 1100px;
-            margin: 0 auto;
-            padding: 24px 20px 40px;
             width: 100%;
         }
 
+        .dashboard-masonry {
+            max-width: 2200px;
+            margin: 0 auto;
+            padding: 18px 20px 40px;
+            column-gap: 18px;
+            column-width: 520px;
+            column-fill: balance;
+        }
+
+        .dashboard-masonry > * {
+            display: inline-block;
+            width: 100%;
+            vertical-align: top;
+            margin: 0 0 18px;
+            break-inside: avoid;
+            page-break-inside: avoid;
+            -webkit-column-break-inside: avoid;
+        }
+
         .top-status {
-            grid-column: 1 / -1;
             background: var(--card-glass);
             border: 1px solid var(--border);
-            border-radius: 18px;
+            border-radius: 0 0 18px 18px;
             padding: 18px 20px;
             box-shadow: var(--shadow);
             position: sticky;
-            top: 16px;
+            top: 0;
             z-index: 10;
             backdrop-filter: blur(10px);
+            width: 100vw;
+            margin-left: calc(50% - 50vw);
+            margin-right: calc(50% - 50vw);
         }
 
         .status-meta {
@@ -1692,12 +2533,11 @@ HTML_TEMPLATE = """
         .aqi-tag.hazard { background: #f4d6f0; color: #7b2f6f; }
 
         .main-layout {
-            grid-column: 1;
-            grid-row: 2 / span 4;
             display: flex;
             flex-direction: column;
             gap: 16px;
             overflow: visible;
+            order: 1;
         }
 
         .side-menu {
@@ -1790,9 +2630,13 @@ HTML_TEMPLATE = """
         }
 
         .btn-secondary {
-            background: #f0f4f1;
+            background: var(--card-alt);
             border-color: var(--border);
             color: var(--ink);
+        }
+
+        .btn-secondary:hover {
+            background: var(--card);
         }
 
         .btn-danger {
@@ -1882,11 +2726,6 @@ HTML_TEMPLATE = """
             font-size: 12px;
         }
 
-        .insight-block.insight-weather { grid-column: 2; grid-row: 2; }
-        .insight-block.insight-history { grid-column: 2; grid-row: 3; }
-        .insight-block.insight-outside { grid-column: 2; grid-row: 4; }
-        .insight-block.insight-schedule { grid-column: 2; grid-row: 5; }
-
         .collapsible-header {
             padding: 14px 16px;
             background: transparent;
@@ -1934,21 +2773,14 @@ HTML_TEMPLATE = """
         .toast.error { background: #b8493a; }
 
         @media (max-width: 980px) {
-            .app-container {
-                display: flex;
-                flex-direction: column;
-            }
-
             .top-status {
                 position: static;
             }
 
-            .main-layout {
-                order: 2;
-            }
-
-            .insight-block {
-                order: 3;
+            .dashboard-masonry {
+                column-count: 1;
+                column-width: auto;
+                padding: 16px 16px 32px;
             }
 
             .side-menu {
@@ -2071,6 +2903,99 @@ HTML_TEMPLATE = """
             </div>
         </div>
 
+        <div class="dashboard-masonry">
+        <!-- Main Layout -->
+        <div class="main-layout">
+            <!-- Side Menu -->
+            <div class="side-menu">
+                <div class="menu-item" data-mode="auto" onclick="selectMode('auto')">
+                    <div class="menu-icon">
+                        <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true">
+                            <circle cx="12" cy="12" r="8"></circle>
+                            <path d="M12 4v2M12 18v2M4 12h2M18 12h2"></path>
+                        </svg>
+                    </div>
+                    <div class="menu-label">Auto</div>
+                </div>
+                <div class="menu-item" data-mode="curve" onclick="selectMode('curve')">
+                    <div class="menu-icon">
+                        <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true">
+                            <path d="M4 16c3-8 6-8 9-4s5 4 7 0"></path>
+                            <circle cx="6" cy="16" r="1.5"></circle>
+                            <circle cx="13" cy="12" r="1.5"></circle>
+                            <circle cx="20" cy="12" r="1.5"></circle>
+                        </svg>
+                    </div>
+                    <div class="menu-label">Curve</div>
+                </div>
+                <div class="menu-item" data-mode="constant" onclick="selectMode('constant')">
+                    <div class="menu-icon">
+                        <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true">
+                            <path d="M5 12h14"></path>
+                            <circle cx="12" cy="12" r="6"></circle>
+                        </svg>
+                    </div>
+                    <div class="menu-label">Constant</div>
+                </div>
+                <div class="menu-item" data-mode="sleep" onclick="selectMode('sleep')">
+                    <div class="menu-icon">
+                        <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true">
+                            <path d="M16 14a6 6 0 1 1-8-8 7 7 0 0 0 8 8z"></path>
+                        </svg>
+                    </div>
+                    <div class="menu-label">Sleep</div>
+                </div>
+            </div>
+            
+            <!-- Content Area --><!-- Content Area -->
+            <div class="content-area">
+                <!-- Settings Panel -->
+                <div class="settings-panel" id="settings-panel">
+                    <div class="settings-header">
+                        <div class="settings-title" id="settings-title">Select a Mode</div>
+                    </div>
+                    <div class="settings-content" id="settings-content">
+                        <p style="opacity: 0.6; text-align: center; padding: 40px;">Select a mode above to configure settings</p>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Temperature Assist -->
+        <div class="schedule-section insight-block">
+            <div class="collapsible-header collapsed" onclick="toggleCollapse(this, 'temp-assist')">
+                <div class="collapsible-title">Temperature Assist</div>
+                <div class="collapse-icon">></div>
+            </div>
+            <div class="collapsible-content collapsed" id="temp-assist-content-wrapper">
+                <div class="temp-assist-controls">
+                    <div class="logging-toggle-row">
+                        <span class="logging-toggle-label">Enable Temperature Assist</span>
+                        <label class="toggle-switch">
+                            <input type="checkbox" id="temp-assist-enabled" onchange="updateTempAssist()">
+                            <span class="toggle-slider"></span>
+                        </label>
+                    </div>
+                    <div class="temp-assist-row">
+                        <span class="temp-assist-row-label">If Temp below:</span>
+                        <div class="temp-assist-row-controls">
+                            <input type="number" class="number-input" id="temp-assist-threshold" min="-10" max="40" step="0.5" value="18" style="width: 90px;" onchange="updateTempAssist()">
+                            <span style="font-size: 12px; color: var(--muted);">&deg;C</span>
+                        </div>
+                    </div>
+                    <div class="temp-assist-row">
+                        <span class="temp-assist-row-label">Reduce fan by:</span>
+                        <div class="temp-assist-row-controls">
+                            <input type="range" class="slider" id="temp-assist-reduce-slider" min="0" max="100" value="10" onchange="syncTempAssistReduce(this.value)">
+                            <input type="number" class="number-input" id="temp-assist-reduce-number" min="0" max="100" value="10" style="width: 70px;" onchange="syncTempAssistReduce(this.value)">
+                            <span style="font-size: 12px; color: var(--muted);">%</span>
+                        </div>
+                    </div>
+                    <div style="font-size: 11px; color: var(--muted);">Applies after Auto/Curve/Constant/Sleep target speed (subtracts % points).</div>
+                </div>
+            </div>
+        </div>
+
         <!-- Weather Section -->
         <div class="weather-section insight-block insight-weather" id="weather-section">
             <div class="collapsible-header collapsed" onclick="toggleCollapse(this, 'weather')">
@@ -2173,65 +3098,124 @@ HTML_TEMPLATE = """
                 </div>
             </div>
         </div>
-        
-        <!-- Main Layout -->
-        <div class="main-layout">
-            <!-- Side Menu -->
-            <div class="side-menu">
-                <div class="menu-item" data-mode="auto" onclick="selectMode('auto')">
-                    <div class="menu-icon">
-                        <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true">
-                            <circle cx="12" cy="12" r="8"></circle>
-                            <path d="M12 4v2M12 18v2M4 12h2M18 12h2"></path>
-                        </svg>
-                    </div>
-                    <div class="menu-label">Auto</div>
-                </div>
-                <div class="menu-item" data-mode="curve" onclick="selectMode('curve')">
-                    <div class="menu-icon">
-                        <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true">
-                            <path d="M4 16c3-8 6-8 9-4s5 4 7 0"></path>
-                            <circle cx="6" cy="16" r="1.5"></circle>
-                            <circle cx="13" cy="12" r="1.5"></circle>
-                            <circle cx="20" cy="12" r="1.5"></circle>
-                        </svg>
-                    </div>
-                    <div class="menu-label">Curve</div>
-                </div>
-                <div class="menu-item" data-mode="constant" onclick="selectMode('constant')">
-                    <div class="menu-icon">
-                        <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true">
-                            <path d="M5 12h14"></path>
-                            <circle cx="12" cy="12" r="6"></circle>
-                        </svg>
-                    </div>
-                    <div class="menu-label">Constant</div>
-                </div>
-                <div class="menu-item" data-mode="sleep" onclick="selectMode('sleep')">
-                    <div class="menu-icon">
-                        <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true">
-                            <path d="M16 14a6 6 0 1 1-8-8 7 7 0 0 0 8 8z"></path>
-                        </svg>
-                    </div>
-                    <div class="menu-label">Sleep</div>
-                </div>
+
+        <!-- Data Logging Section -->
+        <div class="schedule-section insight-block">
+            <div class="collapsible-header collapsed" onclick="toggleCollapse(this, 'logging')">
+                <div class="collapsible-title">Data Logging</div>
+                <div class="collapse-icon">></div>
             </div>
-            
-            <!-- Content Area --><!-- Content Area -->
-            <div class="content-area">
-                <!-- Settings Panel -->
-                <div class="settings-panel" id="settings-panel">
-                    <div class="settings-header">
-                        <div class="settings-title" id="settings-title">Select a Mode</div>
+            <div class="collapsible-content collapsed" id="logging-content-wrapper">
+                <div class="logging-controls">
+                    <div class="logging-toggle-row">
+                        <span class="logging-toggle-label">Enable Logging</span>
+                        <label class="toggle-switch">
+                            <input type="checkbox" id="logging-enabled" onchange="updateLogging()">
+                            <span class="toggle-slider"></span>
+                        </label>
                     </div>
-                    <div class="settings-content" id="settings-content">
-                        <p style="opacity: 0.6; text-align: center; padding: 40px;">Select a mode above to configure settings</p>
+                    <div class="logging-interval-row">
+                        <span class="logging-interval-label">Interval:</span>
+                        <input type="range" class="slider" id="log-interval-slider" min="10" max="300" value="30" onchange="updateLogInterval(this.value)">
+                        <input type="number" class="number-input" id="log-interval-number" min="10" max="300" value="30" style="width: 70px;" onchange="updateLogInterval(this.value)">
+                        <span style="font-size: 12px; color: var(--muted);">sec</span>
                     </div>
+                    <button class="btn btn-secondary" onclick="openLogExplorer()">
+                        Browse Log Files
+                    </button>
                 </div>
             </div>
         </div>
+
+        <!-- Analysis Section -->
+        <div class="schedule-section insight-block">
+            <div class="collapsible-header collapsed" onclick="toggleCollapse(this, 'analysis')">
+                <div class="collapsible-title">Curve Analysis</div>
+                <div class="collapse-icon">></div>
+            </div>
+            <div class="collapsible-content collapsed" id="analysis-content-wrapper">
+                <div class="analysis-status" id="analysis-data-status">
+                    <div class="analysis-status-item">
+                        <span class="analysis-status-label">AQI Data:</span>
+                        <span class="analysis-status-value" id="analysis-aqi-hours">--</span>
+                    </div>
+                    <div class="analysis-status-item">
+                        <span class="analysis-status-label">Fan Speed Data:</span>
+                        <span class="analysis-status-value" id="analysis-fan-hours">--</span>
+                    </div>
+                </div>
+
+                <div class="form-group">
+                    <label class="form-label">Time Period</label>
+                    <select class="select-input" id="analysis-period">
+                        <option value="48">Last 48 hours</option>
+                        <option value="168">Last 7 days</option>
+                        <option value="336">Last 14 days</option>
+                        <option value="720">Last 30 days</option>
+                    </select>
+                </div>
+
+                <div class="form-group">
+                    <label class="form-label">Filter by Weekdays (optional)</label>
+                    <div class="weekday-selector" id="weekday-selector">
+                        <button class="weekday-btn" data-day="0" onclick="toggleWeekday(0)">Mon</button>
+                        <button class="weekday-btn" data-day="1" onclick="toggleWeekday(1)">Tue</button>
+                        <button class="weekday-btn" data-day="2" onclick="toggleWeekday(2)">Wed</button>
+                        <button class="weekday-btn" data-day="3" onclick="toggleWeekday(3)">Thu</button>
+                        <button class="weekday-btn" data-day="4" onclick="toggleWeekday(4)">Fri</button>
+                        <button class="weekday-btn" data-day="5" onclick="toggleWeekday(5)">Sat</button>
+                        <button class="weekday-btn" data-day="6" onclick="toggleWeekday(6)">Sun</button>
+                    </div>
+                </div>
+
+                <label class="checkbox-stylish" style="margin-bottom: 15px;">
+                    <input type="checkbox" id="analysis-outside-aqi">
+                    <span class="checkmark"></span>
+                    <span class="checkbox-label">Include Outside AQI influence</span>
+                </label>
+
+                <div class="form-group">
+                    <label class="form-label">Max Cutoff: <span id="cutoff-value">100%</span></label>
+                    <input type="range" class="slider" id="analysis-cutoff" min="20" max="100" value="100" oninput="document.getElementById('cutoff-value').textContent = this.value + '%'">
+                    <div style="font-size: 11px; color: var(--muted); margin-top: 5px;">Lower values create quieter curves by using lower percentile fan speeds</div>
+                </div>
+
+                <div class="form-group">
+                    <label class="form-label">Curve Name</label>
+                    <input type="text" class="select-input" id="analysis-curve-name" placeholder="Generated Curve" value="Generated Curve">
+                </div>
+
+                <button class="btn" onclick="generateAnalysisCurve()">
+                    Generate Curve
+                </button>
+
+                <div class="curve-preview-container" id="curve-preview-container" style="display: none;">
+                    <div class="curve-preview-info" id="curve-preview-info"></div>
+                    <div class="curve-preview-chart">
+                        <canvas id="curve-preview-canvas"></canvas>
+                    </div>
+                    <button class="btn" onclick="loadGeneratedCurve()">
+                        Load in Curve Editor
+                    </button>
+                </div>
+            </div>
+        </div>
+        </div>
     </div>
     
+    <!-- Log Explorer Modal -->
+    <div class="modal-overlay" id="log-explorer-modal" onclick="if(event.target === this) closeLogExplorer()">
+        <div class="modal-container">
+            <div class="modal-header">
+                <div class="modal-title">Log Files</div>
+                <button class="modal-close" onclick="closeLogExplorer()">&times;</button>
+            </div>
+            <div class="modal-body" id="log-explorer-body">
+                <div style="text-align: center; color: var(--muted);">Loading...</div>
+            </div>
+        </div>
+    </div>
+
     <!-- Toast Messages -->
     <div id="toast" class="toast"></div>
     
@@ -3362,7 +4346,369 @@ HTML_TEMPLATE = """
             toast.className = 'toast ' + type + ' show';
             setTimeout(() => toast.classList.remove('show'), 3000);
         }
-        
+
+        // ============= Logging Functions =============
+        let loggingMinInterval = 10;
+
+        function loadLoggingStatus() {
+            fetch('/api/logging/status')
+                .then(r => r.json())
+                .then(data => {
+                    document.getElementById('logging-enabled').checked = data.enabled;
+                    document.getElementById('log-interval-slider').value = data.interval;
+                    document.getElementById('log-interval-number').value = data.interval;
+                    loggingMinInterval = data.min_interval || 10;
+                    document.getElementById('log-interval-slider').min = loggingMinInterval;
+                    document.getElementById('log-interval-number').min = loggingMinInterval;
+                })
+                .catch(err => console.error('Error loading logging status:', err));
+        }
+
+        function updateLogging() {
+            const enabled = document.getElementById('logging-enabled').checked;
+            fetch('/api/logging/enable', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ enabled: enabled })
+            })
+            .then(r => r.json())
+            .then(data => {
+                showToast(data.enabled ? 'Logging enabled' : 'Logging disabled', 'success');
+            })
+            .catch(err => showToast('Failed to update logging', 'error'));
+        }
+
+        function updateLogInterval(value) {
+            value = Math.max(loggingMinInterval, parseInt(value) || loggingMinInterval);
+            document.getElementById('log-interval-slider').value = value;
+            document.getElementById('log-interval-number').value = value;
+
+            fetch('/api/logging/interval', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ interval: value })
+            })
+            .then(r => r.json())
+            .catch(err => console.error('Error updating interval:', err));
+        }
+
+        // ============= Temperature Assist Functions =============
+        function loadTempAssistStatus() {
+            fetch('/api/temp-assist/status')
+                .then(r => r.json())
+                .then(data => {
+                    const enabledEl = document.getElementById('temp-assist-enabled');
+                    const thresholdEl = document.getElementById('temp-assist-threshold');
+                    const reduceSlider = document.getElementById('temp-assist-reduce-slider');
+                    const reduceNumber = document.getElementById('temp-assist-reduce-number');
+
+                    if (enabledEl) enabledEl.checked = !!data.enabled;
+                    if (thresholdEl) thresholdEl.value = (data.threshold_c ?? 18.0);
+                    if (reduceSlider) reduceSlider.value = (data.reduce_percent ?? 10);
+                    if (reduceNumber) reduceNumber.value = (data.reduce_percent ?? 10);
+                })
+                .catch(err => console.error('Error loading temp assist status:', err));
+        }
+
+        function syncTempAssistReduce(value) {
+            const v = Math.max(0, Math.min(100, parseFloat(value) || 0));
+            const reduceSlider = document.getElementById('temp-assist-reduce-slider');
+            const reduceNumber = document.getElementById('temp-assist-reduce-number');
+            if (reduceSlider) reduceSlider.value = v;
+            if (reduceNumber) reduceNumber.value = v;
+            updateTempAssist();
+        }
+
+        function updateTempAssist() {
+            const enabled = document.getElementById('temp-assist-enabled')?.checked || false;
+            const thresholdC = parseFloat(document.getElementById('temp-assist-threshold')?.value);
+            const reducePercent = parseFloat(document.getElementById('temp-assist-reduce-number')?.value);
+
+            fetch('/api/temp-assist/config', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    enabled: enabled,
+                    threshold_c: isFinite(thresholdC) ? thresholdC : 18.0,
+                    reduce_percent: isFinite(reducePercent) ? reducePercent : 10
+                })
+            })
+            .then(r => r.json())
+            .then(data => {
+                if (data && data.error) showToast(data.error, 'error');
+            })
+            .catch(err => showToast('Failed to update Temperature Assist', 'error'));
+        }
+
+        // ============= Log Explorer Functions =============
+        let currentLogPreview = null;
+
+        function openLogExplorer() {
+            document.getElementById('log-explorer-modal').classList.add('show');
+            loadLogTree();
+            document.addEventListener('keydown', logExplorerKeyHandler);
+        }
+
+        function closeLogExplorer() {
+            document.getElementById('log-explorer-modal').classList.remove('show');
+            document.removeEventListener('keydown', logExplorerKeyHandler);
+        }
+
+        function logExplorerKeyHandler(e) {
+            if (e.key === 'Escape') closeLogExplorer();
+        }
+
+        function loadLogTree() {
+            const body = document.getElementById('log-explorer-body');
+            body.innerHTML = '<div style="text-align: center; color: var(--muted);">Loading...</div>';
+
+            fetch('/api/logs/tree')
+                .then(r => r.json())
+                .then(data => {
+                    if (Object.keys(data).length === 0) {
+                        body.innerHTML = '<div style="text-align: center; color: var(--muted); padding: 40px;">No log files yet. Enable logging and wait for data to be collected.</div>';
+                        return;
+                    }
+
+                    let html = '';
+                    const folderNames = {
+                        'aqi': 'Indoor AQI',
+                        'temperature': 'Temperature',
+                        'humidity': 'Humidity',
+                        'fan_speed': 'Fan Speed',
+                        'outside_aqi': 'Outside AQI',
+                        'outside_temp': 'Outside Temp'
+                    };
+
+                    for (const [folder, files] of Object.entries(data)) {
+                        const totalRows = files.reduce((sum, f) => sum + f.rows, 0);
+                        html += `
+                            <div class="log-folder" id="folder-${folder}">
+                                <div class="log-folder-header" onclick="toggleLogFolder('${folder}')">
+                                    <span class="log-folder-icon">&#128193;</span>
+                                    <span class="log-folder-name">${folderNames[folder] || folder}</span>
+                                    <span class="log-folder-count">${files.length} files, ${totalRows.toLocaleString()} rows</span>
+                                </div>
+                                <div class="log-folder-files">
+                        `;
+
+                        for (const file of files) {
+                            const sizeKB = (file.size / 1024).toFixed(1);
+                            html += `
+                                <div class="log-file">
+                                    <span class="log-file-icon">&#128196;</span>
+                                    <div class="log-file-info">
+                                        <div class="log-file-name">${file.name}</div>
+                                        <div class="log-file-meta">${sizeKB} KB | ${file.rows.toLocaleString()} rows</div>
+                                    </div>
+                                    <div class="log-file-actions">
+                                        <button class="log-file-btn" onclick="previewLogFile('${file.path}')">Preview</button>
+                                        <a class="log-file-btn" href="/api/logs/download/${file.path}" download>Download</a>
+                                    </div>
+                                </div>
+                            `;
+                        }
+
+                        html += '</div></div>';
+                    }
+
+                    html += '<div id="log-preview-area"></div>';
+                    body.innerHTML = html;
+                })
+                .catch(err => {
+                    body.innerHTML = '<div style="text-align: center; color: var(--muted);">Error loading log files</div>';
+                });
+        }
+
+        function toggleLogFolder(folder) {
+            const elem = document.getElementById('folder-' + folder);
+            elem.classList.toggle('expanded');
+        }
+
+        function previewLogFile(path) {
+            const area = document.getElementById('log-preview-area');
+            area.innerHTML = '<div style="text-align: center; color: var(--muted); padding: 20px;">Loading preview...</div>';
+
+            fetch('/api/logs/file/' + path)
+                .then(r => r.json())
+                .then(data => {
+                    if (data.error) {
+                        area.innerHTML = '<div class="log-preview">Error: ' + data.error + '</div>';
+                        return;
+                    }
+
+                    let content = data.header + '\\n' + data.preview.join('\\n');
+                    area.innerHTML = `
+                        <div style="margin-top: 15px; padding-top: 15px; border-top: 1px solid var(--border);">
+                            <div style="font-size: 13px; margin-bottom: 8px; color: var(--ink);">
+                                <strong>Preview:</strong> Showing ${data.showing} of ${data.total_rows} rows
+                            </div>
+                            <div class="log-preview">${content}</div>
+                        </div>
+                    `;
+                })
+                .catch(err => {
+                    area.innerHTML = '<div class="log-preview">Error loading preview</div>';
+                });
+        }
+
+        // ============= Analysis Functions =============
+        let selectedWeekdays = [];
+        let generatedCurve = null;
+        let curvePreviewChart = null;
+
+        function loadAnalysisDataRange() {
+            fetch('/api/analysis/data-range')
+                .then(r => r.json())
+                .then(data => {
+                    const aqiHours = data.aqi?.hours || 0;
+                    const fanHours = data.fan_speed?.hours || 0;
+
+                    document.getElementById('analysis-aqi-hours').textContent =
+                        aqiHours > 0 ? `${aqiHours.toFixed(1)} hours (${(data.aqi?.rows || 0).toLocaleString()} points)` : 'No data';
+                    document.getElementById('analysis-fan-hours').textContent =
+                        fanHours > 0 ? `${fanHours.toFixed(1)} hours (${(data.fan_speed?.rows || 0).toLocaleString()} points)` : 'No data';
+                })
+                .catch(err => console.error('Error loading data range:', err));
+        }
+
+        function toggleWeekday(day) {
+            const btn = document.querySelector(`.weekday-btn[data-day="${day}"]`);
+            const idx = selectedWeekdays.indexOf(day);
+
+            if (idx === -1) {
+                selectedWeekdays.push(day);
+                btn.classList.add('active');
+            } else {
+                selectedWeekdays.splice(idx, 1);
+                btn.classList.remove('active');
+            }
+        }
+
+        function generateAnalysisCurve() {
+            const hours = parseInt(document.getElementById('analysis-period').value);
+            const includeOutsideAqi = document.getElementById('analysis-outside-aqi').checked;
+            const maxCutoff = parseInt(document.getElementById('analysis-cutoff').value) / 100;
+            const weekdays = selectedWeekdays.length > 0 ? selectedWeekdays : null;
+
+            showToast('Generating curve...', '');
+
+            fetch('/api/analysis/generate-curve', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    hours: hours,
+                    include_outside_aqi: includeOutsideAqi,
+                    max_cutoff: maxCutoff,
+                    weekdays: weekdays
+                })
+            })
+            .then(r => r.json())
+            .then(data => {
+                if (data.error) {
+                    showToast('Error: ' + data.error, 'error');
+                    return;
+                }
+
+                generatedCurve = data.curve;
+                showCurvePreview(data);
+                showToast('Curve generated successfully', 'success');
+            })
+            .catch(err => showToast('Failed to generate curve', 'error'));
+        }
+
+        function showCurvePreview(data) {
+            const container = document.getElementById('curve-preview-container');
+            const info = document.getElementById('curve-preview-info');
+
+            info.textContent = `Generated from ${data.data_points.toLocaleString()} data points over ${data.hours_analyzed} hours using ${data.buckets_used} AQI buckets`;
+
+            container.style.display = 'block';
+
+            // Create or update chart
+            const ctx = document.getElementById('curve-preview-canvas').getContext('2d');
+            const theme = getChartTheme();
+
+            if (curvePreviewChart) {
+                curvePreviewChart.destroy();
+            }
+
+            curvePreviewChart = new Chart(ctx, {
+                type: 'line',
+                data: {
+                    labels: data.curve.map(p => p[0]),
+                    datasets: [{
+                        label: 'Fan Speed %',
+                        data: data.curve.map(p => p[1]),
+                        borderColor: theme.accent,
+                        backgroundColor: theme.accentSoft,
+                        fill: true,
+                        tension: 0.4
+                    }]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    scales: {
+                        x: {
+                            title: { display: true, text: 'AQI', color: theme.text },
+                            ticks: { color: theme.text },
+                            grid: { color: theme.grid }
+                        },
+                        y: {
+                            title: { display: true, text: 'Fan Speed %', color: theme.text },
+                            min: 0,
+                            max: 100,
+                            ticks: { color: theme.text },
+                            grid: { color: theme.grid }
+                        }
+                    },
+                    plugins: {
+                        legend: { display: false }
+                    }
+                }
+            });
+        }
+
+        function loadGeneratedCurve() {
+            if (!generatedCurve || generatedCurve.length < 2) {
+                showToast('No curve to load', 'error');
+                return;
+            }
+
+            const curveName = document.getElementById('analysis-curve-name').value || 'Generated Curve';
+
+            // Save the curve
+            fetch('/api/save-curve', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    name: curveName,
+                    curve: generatedCurve,
+                    smooth: 'smooth'
+                })
+            })
+            .then(r => r.json())
+            .then(data => {
+                if (data.success) {
+                    showToast('Curve saved as "' + curveName + '"', 'success');
+                    // Open curve editor
+                    selectMode('curve');
+                    setTimeout(() => openSettings('curve'), 100);
+                } else {
+                    showToast('Failed to save curve', 'error');
+                }
+            })
+            .catch(err => showToast('Failed to save curve', 'error'));
+        }
+
+        // Initialize logging and analysis on page load
+        document.addEventListener('DOMContentLoaded', function() {
+            loadLoggingStatus();
+            loadAnalysisDataRange();
+            loadTempAssistStatus();
+        });
+
     </script>
 </body>
 </html>
@@ -3685,9 +5031,169 @@ def api_set_selected_curve():
     return jsonify(snapshot_state())
 
 
+# ============= Logging API Endpoints =============
+
+@app.get("/api/logging/status")
+def api_logging_status():
+    """Get current logging status"""
+    with state_lock:
+        return jsonify({
+            "enabled": state.get("logging_enabled", False),
+            "interval": state.get("log_interval", MIN_LOG_INTERVAL),
+            "min_interval": MIN_LOG_INTERVAL
+        })
+
+
+@app.post("/api/logging/enable")
+def api_logging_enable():
+    """Enable or disable logging"""
+    payload = request.get_json(silent=True) or {}
+    enabled = payload.get("enabled", False)
+
+    with state_lock:
+        state["logging_enabled"] = bool(enabled)
+
+    save_state()
+    return jsonify({
+        "enabled": state.get("logging_enabled", False),
+        "interval": state.get("log_interval", MIN_LOG_INTERVAL)
+    })
+
+# ============= Temperature Assist API Endpoints =============
+
+@app.get("/api/temp-assist/status")
+def api_temp_assist_status():
+    """Get Temperature Assist configuration"""
+    with state_lock:
+        return jsonify({
+            "enabled": bool(state.get("temp_assist_enabled", False)),
+            "threshold_c": state.get("temp_assist_threshold_c", 18.0),
+            "reduce_percent": state.get("temp_assist_reduce_percent", 10),
+        })
+
+
+@app.post("/api/temp-assist/config")
+def api_temp_assist_config():
+    """Update Temperature Assist configuration"""
+    payload = request.get_json(silent=True) or {}
+    enabled = bool(payload.get("enabled", False))
+    threshold_c = payload.get("threshold_c", 18.0)
+    reduce_percent = payload.get("reduce_percent", 10)
+
+    try:
+        threshold_c = float(threshold_c)
+        reduce_percent = float(reduce_percent)
+    except (TypeError, ValueError):
+        return jsonify({"error": "Invalid parameters"}), 400
+
+    threshold_c = max(-10.0, min(40.0, threshold_c))
+    reduce_percent = max(0.0, min(100.0, reduce_percent))
+
+    with state_lock:
+        state["temp_assist_enabled"] = enabled
+        state["temp_assist_threshold_c"] = threshold_c
+        state["temp_assist_reduce_percent"] = reduce_percent
+
+    save_state()
+    return jsonify({
+        "enabled": bool(state.get("temp_assist_enabled", False)),
+        "threshold_c": state.get("temp_assist_threshold_c", 18.0),
+        "reduce_percent": state.get("temp_assist_reduce_percent", 10),
+    })
+
+
+@app.post("/api/logging/interval")
+def api_logging_interval():
+    """Set logging interval"""
+    payload = request.get_json(silent=True) or {}
+    interval = payload.get("interval", MIN_LOG_INTERVAL)
+
+    try:
+        interval = max(MIN_LOG_INTERVAL, int(interval))
+    except (TypeError, ValueError):
+        interval = MIN_LOG_INTERVAL
+
+    with state_lock:
+        state["log_interval"] = interval
+
+    save_state()
+    return jsonify({
+        "enabled": state.get("logging_enabled", False),
+        "interval": state.get("log_interval", MIN_LOG_INTERVAL)
+    })
+
+
+# ============= Log Explorer API Endpoints =============
+
+@app.get("/api/logs/tree")
+def api_logs_tree():
+    """Get log file tree structure"""
+    return jsonify(log_manager.get_log_tree())
+
+
+@app.get("/api/logs/file/<path:filepath>")
+def api_logs_file_preview(filepath: str):
+    """Preview a log file content"""
+    preview = log_manager.read_file_preview(filepath)
+    return jsonify(preview)
+
+
+@app.get("/api/logs/download/<path:filepath>")
+def api_logs_download(filepath: str):
+    """Download a log file"""
+    absolute_path = log_manager.get_file_path(filepath)
+    if absolute_path is None:
+        return jsonify({"error": "File not found"}), 404
+
+    return send_file(
+        absolute_path,
+        mimetype='text/csv',
+        as_attachment=True,
+        download_name=os.path.basename(filepath)
+    )
+
+
+# ============= Analysis API Endpoints =============
+
+@app.get("/api/analysis/data-range")
+def api_analysis_data_range():
+    """Get available data range for analysis"""
+    return jsonify(analysis_engine.get_available_data_range())
+
+
+@app.post("/api/analysis/generate-curve")
+def api_analysis_generate_curve():
+    """Generate an optimized curve from logged data"""
+    payload = request.get_json(silent=True) or {}
+
+    hours = payload.get("hours", 48)
+    include_outside_aqi = payload.get("include_outside_aqi", False)
+    max_cutoff = payload.get("max_cutoff", 1.0)
+    weekdays = payload.get("weekdays", None)
+
+    try:
+        hours = max(1, int(hours))
+        max_cutoff = max(0.2, min(1.0, float(max_cutoff)))
+        if weekdays is not None:
+            weekdays = [int(d) for d in weekdays if 0 <= int(d) <= 6]
+    except (TypeError, ValueError):
+        return jsonify({"error": "Invalid parameters"}), 400
+
+    result = analysis_engine.generate_curve(
+        hours=hours,
+        include_outside_aqi=include_outside_aqi,
+        max_cutoff=max_cutoff,
+        weekdays=weekdays
+    )
+
+    return jsonify(result)
+
+
 # Start control loop in background
 threading.Thread(target=control_loop, daemon=True).start()
 
+# Start logging loop in background
+threading.Thread(target=logging_loop, daemon=True).start()
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=PORT, debug=True)
-
