@@ -229,6 +229,12 @@ LEVEL_MAX = env_int("LEVEL_MAX", 14)
 POLL_INTERVAL = env_int("POLL_INTERVAL", 5)
 PORT = env_int("PORT", 5000)
 
+# Air quality location configuration
+AIR_QUALITY_CITY = os.getenv("AIR_QUALITY_CITY", "Belgrade").strip()
+AIR_QUALITY_LATITUDE = env_float("AIR_QUALITY_LATITUDE", 44.7866)
+AIR_QUALITY_LONGITUDE = env_float("AIR_QUALITY_LONGITUDE", 20.4489)
+AIR_QUALITY_TIMEZONE = os.getenv("AIR_QUALITY_TIMEZONE", "Europe/Belgrade").strip()
+
 if not MIIO_IP or not MIIO_TOKEN:
     raise SystemExit("MIIO_IP and MIIO_TOKEN are required in .env file")
 
@@ -540,64 +546,20 @@ def get_weather(location: str) -> dict:
         print(f"Weather API error for {location}: {e}")
         return {"error": str(e)}
 
-def get_belgrade_aqi() -> dict:
-    """Get Belgrade AQI from OpenAQ API (free, no API key needed)"""
+def get_outside_aqi() -> dict:
+    """Get outside AQI from Open-Meteo API using configured location"""
     try:
-        # Try OpenAQ API for air quality
-        url = "https://api.openaq.org/v2/latest?location_id=7961&limit=1"
-        resp = requests.get(url, timeout=5)
-        if resp.status_code == 200:
-            data = resp.json()
-            if data.get("results") and len(data["results"]) > 0:
-                result = data["results"][0]
-                measurements = result.get("measurements", [])
-                pm25 = None
-                pm10 = None
-                for m in measurements:
-                    if m.get("parameter") == "pm25":
-                        pm25 = m.get("value")
-                    elif m.get("parameter") == "pm10":
-                        pm10 = m.get("value")
-                
-                # Convert PM2.5 to AQI (simplified)
-                aqi = None
-                if pm25:
-                    # US AQI calculation for PM2.5
-                    if pm25 <= 12:
-                        aqi = int((pm25 / 12) * 50)
-                    elif pm25 <= 35.4:
-                        aqi = int(50 + ((pm25 - 12) / (35.4 - 12)) * 50)
-                    elif pm25 <= 55.4:
-                        aqi = int(100 + ((pm25 - 35.4) / (55.4 - 35.4)) * 50)
-                    elif pm25 <= 150.4:
-                        aqi = int(150 + ((pm25 - 55.4) / (150.4 - 55.4)) * 100)
-                    elif pm25 <= 250.4:
-                        aqi = int(200 + ((pm25 - 150.4) / (250.4 - 150.4)) * 100)
-                    else:
-                        aqi = int(300 + ((pm25 - 250.4) / (350.4 - 250.4)) * 100)
-                
-                return {
-                    "aqi": aqi,
-                    "pm25": pm25,
-                    "pm10": pm10,
-                    "location": "Belgrade",
-                    "timestamp": result.get("lastUpdated", "")
-                }
-    except Exception as e:
-        print(f"Belgrade AQI API error: {e}")
-    
-    # Fallback: try Open-Meteo air quality API
-    try:
-        url = "https://air-quality-api.open-meteo.com/v1/air-quality?latitude=44.7866&longitude=20.4489&current=pm10,pm2_5&timezone=Europe/Belgrade"
+        url = f"https://air-quality-api.open-meteo.com/v1/air-quality?latitude={AIR_QUALITY_LATITUDE}&longitude={AIR_QUALITY_LONGITUDE}&current=pm10,pm2_5&timezone={AIR_QUALITY_TIMEZONE}"
         resp = requests.get(url, timeout=5)
         if resp.status_code == 200:
             data = resp.json()
             current = data.get("current", {})
             pm25 = current.get("pm2_5")
             pm10 = current.get("pm10")
-            
+
             aqi = None
             if pm25:
+                # US AQI calculation for PM2.5
                 if pm25 <= 12:
                     aqi = int((pm25 / 12) * 50)
                 elif pm25 <= 35.4:
@@ -610,24 +572,23 @@ def get_belgrade_aqi() -> dict:
                     aqi = int(200 + ((pm25 - 150.4) / (250.4 - 150.4)) * 100)
                 else:
                     aqi = int(300 + ((pm25 - 250.4) / (350.4 - 250.4)) * 100)
-            
+
             return {
                 "aqi": aqi,
                 "pm25": pm25,
                 "pm10": pm10,
-                "location": "Belgrade",
+                "location": AIR_QUALITY_CITY,
                 "timestamp": current.get("time", "")
             }
     except Exception as e:
-        print(f"Belgrade AQI fallback API error: {e}")
-    
+        print(f"Outside AQI API error: {e}")
+
     return {"error": "Unable to fetch AQI data"}
 
-def get_belgrade_air_quality_history() -> list:
-    """Get historical air quality data for Belgrade"""
+def get_outside_air_quality_history() -> list:
+    """Get historical air quality data for configured location (last 24 hours)"""
     try:
-        # Get hourly data for last 6 hours
-        url = "https://air-quality-api.open-meteo.com/v1/air-quality?latitude=44.7866&longitude=20.4489&hourly=pm10,pm2_5,temperature_2m&timezone=Europe/Belgrade&forecast_days=1&past_days=1"
+        url = f"https://air-quality-api.open-meteo.com/v1/air-quality?latitude={AIR_QUALITY_LATITUDE}&longitude={AIR_QUALITY_LONGITUDE}&hourly=pm10,pm2_5,temperature_2m&timezone={AIR_QUALITY_TIMEZONE}&forecast_days=1&past_days=1"
         resp = requests.get(url, timeout=5)
         if resp.status_code == 200:
             data = resp.json()
@@ -636,49 +597,48 @@ def get_belgrade_air_quality_history() -> list:
             pm25 = hourly.get("pm2_5", [])
             pm10 = hourly.get("pm10", [])
             temp = hourly.get("temperature_2m", [])
-            
-            # Get last 6 hours
+
             result = []
             now = dt.datetime.now()
-            for i in range(len(times) - 1, max(0, len(times) - 7), -1):
-                if i < len(times):
-                    time_str = times[i]
-                    try:
-                        time_obj = dt.datetime.fromisoformat(time_str.replace('Z', '+00:00'))
-                        if (now - time_obj.replace(tzinfo=None)).total_seconds() <= 21600:  # 6 hours
-                            pm25_val = pm25[i] if i < len(pm25) else None
-                            pm10_val = pm10[i] if i < len(pm10) else None
-                            temp_val = temp[i] if i < len(temp) else None
-                            
-                            aqi = None
-                            if pm25_val:
-                                if pm25_val <= 12:
-                                    aqi = int((pm25_val / 12) * 50)
-                                elif pm25_val <= 35.4:
-                                    aqi = int(50 + ((pm25_val - 12) / (35.4 - 12)) * 50)
-                                elif pm25_val <= 55.4:
-                                    aqi = int(100 + ((pm25_val - 35.4) / (55.4 - 35.4)) * 50)
-                                elif pm25_val <= 150.4:
-                                    aqi = int(150 + ((pm25_val - 55.4) / (150.4 - 55.4)) * 100)
-                                elif pm25_val <= 250.4:
-                                    aqi = int(200 + ((pm25_val - 150.4) / (250.4 - 150.4)) * 100)
-                                else:
-                                    aqi = int(300 + ((pm25_val - 250.4) / (350.4 - 250.4)) * 100)
-                            
-                            result.append({
-                                "timestamp": time_str,
-                                "aqi": aqi,
-                                "pm25": pm25_val,
-                                "pm10": pm10_val,
-                                "temperature": temp_val
-                            })
-                    except:
-                        continue
-            
+            for i in range(len(times)):
+                time_str = times[i]
+                try:
+                    time_obj = dt.datetime.fromisoformat(time_str.replace('Z', '+00:00'))
+                    # Get last 24 hours of data
+                    if (now - time_obj.replace(tzinfo=None)).total_seconds() <= 86400:  # 24 hours
+                        pm25_val = pm25[i] if i < len(pm25) else None
+                        pm10_val = pm10[i] if i < len(pm10) else None
+                        temp_val = temp[i] if i < len(temp) else None
+
+                        aqi = None
+                        if pm25_val:
+                            if pm25_val <= 12:
+                                aqi = int((pm25_val / 12) * 50)
+                            elif pm25_val <= 35.4:
+                                aqi = int(50 + ((pm25_val - 12) / (35.4 - 12)) * 50)
+                            elif pm25_val <= 55.4:
+                                aqi = int(100 + ((pm25_val - 35.4) / (55.4 - 35.4)) * 50)
+                            elif pm25_val <= 150.4:
+                                aqi = int(150 + ((pm25_val - 55.4) / (150.4 - 55.4)) * 100)
+                            elif pm25_val <= 250.4:
+                                aqi = int(200 + ((pm25_val - 150.4) / (250.4 - 150.4)) * 100)
+                            else:
+                                aqi = int(300 + ((pm25_val - 250.4) / (350.4 - 250.4)) * 100)
+
+                        result.append({
+                            "timestamp": time_str,
+                            "aqi": aqi,
+                            "pm25": pm25_val,
+                            "pm10": pm10_val,
+                            "temperature": temp_val
+                        })
+                except:
+                    continue
+
             return sorted(result, key=lambda x: x["timestamp"])
     except Exception as e:
-        print(f"Belgrade air quality history error: {e}")
-    
+        print(f"Outside air quality history error: {e}")
+
     return []
 
 def check_sleep_schedule() -> tuple[str | None, bool]:
@@ -864,15 +824,13 @@ HTML_TEMPLATE = """
             padding: 0;
             color: #ffffff;
             overflow-x: hidden;
-            position: fixed;
-            width: 100%;
-            height: 100%;
+            overflow-y: auto;
         }
-        
+
         .app-container {
             display: flex;
             flex-direction: column;
-            height: 100vh;
+            min-height: 100vh;
             width: 100%;
         }
         
@@ -1598,20 +1556,20 @@ HTML_TEMPLATE = """
 
         .app-container {
             display: grid;
-            grid-template-columns: 92px minmax(0, 1.2fr) minmax(0, 0.8fr);
+            grid-template-columns: minmax(0, 1.2fr) minmax(0, 0.8fr);
             grid-auto-rows: min-content;
             gap: 18px;
             align-items: start;
             height: auto;
             min-height: 100vh;
-            max-width: 1200px;
+            max-width: 1100px;
             margin: 0 auto;
             padding: 24px 20px 40px;
             width: 100%;
         }
 
         .top-status {
-            grid-column: 2 / -1;
+            grid-column: 1 / -1;
             background: var(--card-glass);
             border: 1px solid var(--border);
             border-radius: 18px;
@@ -1621,59 +1579,6 @@ HTML_TEMPLATE = """
             top: 16px;
             z-index: 10;
             backdrop-filter: blur(10px);
-        }
-
-        .side-nav {
-            grid-column: 1;
-            grid-row: 1 / -1;
-            display: flex;
-            flex-direction: column;
-            gap: 10px;
-            padding: 12px 10px;
-            background: var(--card-glass);
-            border: 1px solid var(--border);
-            border-radius: 18px;
-            box-shadow: var(--shadow);
-            position: sticky;
-            top: 16px;
-            align-self: start;
-        }
-
-        .nav-brand {
-            font-size: 11px;
-            font-weight: 700;
-            text-transform: uppercase;
-            letter-spacing: 0.18em;
-            color: var(--muted);
-            text-align: center;
-            padding: 8px 4px 2px;
-        }
-
-        .nav-item {
-            display: flex;
-            flex-direction: column;
-            align-items: center;
-            gap: 6px;
-            padding: 12px 8px;
-            border-radius: 14px;
-            border: 1px solid transparent;
-            color: var(--ink);
-            text-decoration: none;
-            font-size: 11px;
-            font-weight: 600;
-            letter-spacing: 0.04em;
-            transition: background 0.2s ease, border-color 0.2s ease;
-        }
-
-        .nav-item svg {
-            width: 24px;
-            height: 24px;
-        }
-
-        .nav-item.active {
-            background: var(--accent-soft);
-            border-color: var(--accent);
-            color: var(--accent-strong);
         }
 
         .status-meta {
@@ -1701,7 +1606,6 @@ HTML_TEMPLATE = """
         .mode-pill[data-mode="curve"] { background: #e9eefb; color: #3f5fb7; }
         .mode-pill[data-mode="constant"] { background: #fff3d7; color: #9b6a1f; }
         .mode-pill[data-mode="sleep"] { background: #fde9e0; color: #a4513b; }
-        .mode-pill.camera-pill { background: rgba(99, 122, 255, 0.12); color: #3f5fb7; }
 
         .mode-caption {
             font-size: 12px;
@@ -1788,7 +1692,7 @@ HTML_TEMPLATE = """
         .aqi-tag.hazard { background: #f4d6f0; color: #7b2f6f; }
 
         .main-layout {
-            grid-column: 2;
+            grid-column: 1;
             grid-row: 2 / span 4;
             display: flex;
             flex-direction: column;
@@ -1978,30 +1882,10 @@ HTML_TEMPLATE = """
             font-size: 12px;
         }
 
-        .insight-block.insight-weather { grid-column: 3; grid-row: 2; }
-        .insight-block.insight-history { grid-column: 3; grid-row: 3; }
-        .insight-block.insight-outside { grid-column: 3; grid-row: 4; }
-        .insight-block.insight-schedule { grid-column: 3; grid-row: 5; }
-
-        .camera-shell {
-            grid-column: 2 / -1;
-            grid-row: 2;
-            background: var(--card);
-            border: 1px solid var(--border);
-            border-radius: 18px;
-            padding: 28px;
-            box-shadow: var(--shadow);
-        }
-
-        .camera-shell h2 {
-            font-size: 22px;
-            margin-bottom: 8px;
-        }
-
-        .camera-shell p {
-            color: var(--muted);
-            font-size: 14px;
-        }
+        .insight-block.insight-weather { grid-column: 2; grid-row: 2; }
+        .insight-block.insight-history { grid-column: 2; grid-row: 3; }
+        .insight-block.insight-outside { grid-column: 2; grid-row: 4; }
+        .insight-block.insight-schedule { grid-column: 2; grid-row: 5; }
 
         .collapsible-header {
             padding: 14px 16px;
@@ -2059,37 +1943,12 @@ HTML_TEMPLATE = """
                 position: static;
             }
 
-            .side-nav {
-                position: static;
-                flex-direction: row;
-                justify-content: space-between;
-                align-items: center;
-                width: 100%;
-                padding: 10px 12px;
-            }
-
-            .nav-brand {
-                text-align: left;
-                padding: 0;
-            }
-
-            .nav-item {
-                flex-direction: row;
-                gap: 8px;
-                padding: 8px 10px;
-                font-size: 12px;
-            }
-
             .main-layout {
                 order: 2;
             }
 
             .insight-block {
                 order: 3;
-            }
-
-            .camera-shell {
-                order: 2;
             }
 
             .side-menu {
@@ -2179,39 +2038,16 @@ HTML_TEMPLATE = """
 </head>
 <body>
     <div class="app-container">
-        <nav class="side-nav">
-            <div class="nav-brand">Mi Control</div>
-            <a class="nav-item {% if page == 'purifier' %}active{% endif %}" href="/">
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true">
-                    <circle cx="12" cy="12" r="8"></circle>
-                    <path d="M12 4v2M12 18v2M4 12h2M18 12h2"></path>
-                </svg>
-                <span>Purifier</span>
-            </a>
-            <a class="nav-item {% if page == 'camera' %}active{% endif %}" href="/camera">
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true">
-                    <rect x="3" y="7" width="14" height="10" rx="2"></rect>
-                    <path d="M17 9l4-2v10l-4-2"></path>
-                </svg>
-                <span>Camera</span>
-            </a>
-        </nav>
         <!-- Top Status Bar -->
         <div class="top-status">
             <div class="status-meta">
-                {% if page == 'purifier' %}
                 <div class="mode-pill" id="mode-pill">Mode: --</div>
                 <div class="mode-caption">Live room readings</div>
-                {% else %}
-                <div class="mode-pill camera-pill">Camera</div>
-                <div class="mode-caption">Camera controls coming soon.</div>
-                {% endif %}
                 <div class="theme-switch">
                     <span class="theme-label">Theme</span>
                     <button class="theme-toggle" id="theme-toggle" type="button" onclick="toggleTheme()">Light</button>
                 </div>
             </div>
-            {% if page == 'purifier' %}
             <div class="status-row">
                 <div class="status-box">
                     <div class="status-label">AQI</div>
@@ -2233,10 +2069,8 @@ HTML_TEMPLATE = """
                     <div class="status-value" id="humidity">--</div>
                 </div>
             </div>
-            {% endif %}
         </div>
-        
-        {% if page == 'purifier' %}
+
         <!-- Weather Section -->
         <div class="weather-section insight-block insight-weather" id="weather-section">
             <div class="collapsible-header collapsed" onclick="toggleCollapse(this, 'weather')">
@@ -2274,32 +2108,32 @@ HTML_TEMPLATE = """
             </div>
         </div>
         
-        <!-- Belgrade Outside Air Quality -->
+        <!-- Outside Air Quality -->
         <div class="graph-section insight-block insight-outside">
-            <div class="collapsible-header collapsed" onclick="toggleCollapse(this, 'belgrade-air')">
-                <div class="collapsible-title">Belgrade Outside Air Quality</div>
+            <div class="collapsible-header collapsed" onclick="toggleCollapse(this, 'outside-air')">
+                <div class="collapsible-title">Outside Air Quality</div>
                 <div class="collapse-icon">></div>
             </div>
-            <div class="collapsible-content collapsed" id="belgrade-air-content-wrapper">
+            <div class="collapsible-content collapsed" id="outside-air-content-wrapper">
                 <div style="margin-bottom: 15px; padding: 12px; background: var(--card); border-radius: 12px; border: 1px solid var(--border);">
                     <div style="display: flex; justify-content: space-between; align-items: center;">
                         <div>
                             <div style="font-size: 11px; color: var(--muted); margin-bottom: 5px; text-transform: uppercase; letter-spacing: 0.08em;">Current AQI</div>
-                            <div style="font-size: 24px; font-weight: 700;" id="belgrade-aqi">--</div>
+                            <div style="font-size: 24px; font-weight: 700;" id="outside-aqi">--</div>
                         </div>
                         <div style="text-align: right;">
                             <div style="font-size: 11px; color: var(--muted); margin-bottom: 5px; text-transform: uppercase; letter-spacing: 0.08em;">PM2.5</div>
-                            <div style="font-size: 16px;" id="belgrade-pm25">--</div>
+                            <div style="font-size: 16px;" id="outside-pm25">--</div>
                         </div>
                     </div>
                 </div>
-                <div class="graph-title">Outside AQI</div>
+                <div class="graph-title">Outside AQI (24h)</div>
                 <div class="graph-container">
-                    <canvas id="belgradeAQIChart"></canvas>
+                    <canvas id="outsideAQIChart"></canvas>
                 </div>
-                <div class="graph-title">Outside Temperature</div>
+                <div class="graph-title">Outside Temperature (24h)</div>
                 <div class="graph-container">
-                    <canvas id="belgradeTempChart"></canvas>
+                    <canvas id="outsideTempChart"></canvas>
                 </div>
             </div>
         </div>
@@ -2396,12 +2230,6 @@ HTML_TEMPLATE = """
                 </div>
             </div>
         </div>
-        {% else %}
-        <div class="camera-shell">
-            <h2>Camera</h2>
-            <p>This page is ready for the camera feed and controls. Wire up the stream and actions when you're ready.</p>
-        </div>
-        {% endif %}
     </div>
     
     <!-- Toast Messages -->
@@ -2415,8 +2243,8 @@ HTML_TEMPLATE = """
         let historicalChartTemp = null;
         let historicalChartHumidity = null;
         let historicalChartFanSpeed = null;
-        let belgradeAQIChart = null;
-        let belgradeTempChart = null;
+        let outsideAQIChart = null;
+        let outsideTempChart = null;
         let curvePoints = {{ state.current_curve | tojson }};
         let savedCurvesList = {};
 
@@ -2516,7 +2344,7 @@ HTML_TEMPLATE = """
 
         function refreshCharts() {
             loadHistorical();
-            loadBelgradeAirQuality();
+            loadOutsideAirQuality();
             updateCurveChartTheme();
         }
 
@@ -2553,13 +2381,13 @@ HTML_TEMPLATE = """
         loadSavedCurves();
         loadWeather();
         setInterval(loadWeather, 300000); // Update weather every 5 minutes
-        loadBelgradeAQI();
-        setInterval(loadBelgradeAQI, 300000); // Update Belgrade AQI every 5 minutes
+        loadOutsideAQI();
+        setInterval(loadOutsideAQI, 300000); // Update outside AQI every 5 minutes
         setTimeout(() => {
             loadHistorical();
             setInterval(loadHistorical, 60000); // Update historical every minute
-            loadBelgradeAirQuality();
-            setInterval(loadBelgradeAirQuality, 300000); // Update Belgrade air quality every 5 minutes
+            loadOutsideAirQuality();
+            setInterval(loadOutsideAirQuality, 300000); // Update outside air quality every 5 minutes
         }, 1000); // Wait a bit for chart.js to be ready
         loadSchedule();
         
@@ -2855,26 +2683,35 @@ HTML_TEMPLATE = """
                 .catch(err => console.error('Historical data failed:', err));
         }
 
-        function loadBelgradeAQI() {
-            fetch('/api/belgrade-aqi')
+        function loadOutsideAQI() {
+            fetch('/api/outside-aqi')
                 .then(r => r.json())
                 .then(data => {
                     if (data && !data.error) {
-                        document.getElementById('belgrade-aqi').textContent = data.aqi !== null ? data.aqi : '--';
-                        const pmEl = document.getElementById('belgrade-pm25');
+                        document.getElementById('outside-aqi').textContent = data.aqi !== null ? data.aqi : '--';
+                        const pmEl = document.getElementById('outside-pm25');
                         if (pmEl) {
                             pmEl.innerHTML = data.pm25 !== null ? data.pm25.toFixed(1) + ' &micro;g/m&sup3;' : '--';
                         }
                     }
                 })
-                .catch(err => console.error('Belgrade AQI failed:', err));
+                .catch(err => console.error('Outside AQI failed:', err));
         }
 
-        function loadBelgradeAirQuality() {
-            fetch('/api/belgrade-air-quality')
+        function loadOutsideAirQuality() {
+            fetch('/api/outside-air-quality')
                 .then(r => r.json())
                 .then(data => {
                     if (!data.data || data.data.length === 0) return;
+
+                    const theme = getChartTheme();
+                    const cityName = data.city || 'Outside';
+
+                    // Update the section title with city name
+                    const titleEl = document.querySelector('#outside-air-content-wrapper').closest('.graph-section').querySelector('.collapsible-title');
+                    if (titleEl) {
+                        titleEl.textContent = cityName + ' Outside Air Quality';
+                    }
 
                     const labels = data.data.map(d => {
                         const date = new Date(d.timestamp);
@@ -2884,16 +2721,16 @@ HTML_TEMPLATE = """
                     const aqiData = data.data.map(d => d.aqi || 0);
                     const tempData = data.data.map(d => d.temperature || 0);
 
-                    // Belgrade AQI Chart
-                    const ctxAQI = document.getElementById('belgradeAQIChart');
+                    // Outside AQI Chart
+                    const ctxAQI = document.getElementById('outsideAQIChart');
                     if (ctxAQI) {
-                        if (belgradeAQIChart) belgradeAQIChart.destroy();
-                        belgradeAQIChart = new Chart(ctxAQI, {
+                        if (outsideAQIChart) outsideAQIChart.destroy();
+                        outsideAQIChart = new Chart(ctxAQI, {
                             type: 'line',
                             data: {
                                 labels: labels,
                                 datasets: [{
-                                    label: 'Belgrade AQI',
+                                    label: cityName + ' AQI (24h)',
                                     data: aqiData,
                                     borderColor: theme.aqi,
                                     backgroundColor: toRgba(theme.aqi, 0.12),
@@ -2925,16 +2762,16 @@ HTML_TEMPLATE = """
                         });
                     }
 
-                    // Belgrade Temperature Chart
-                    const ctxTemp = document.getElementById('belgradeTempChart');
+                    // Outside Temperature Chart
+                    const ctxTemp = document.getElementById('outsideTempChart');
                     if (ctxTemp) {
-                        if (belgradeTempChart) belgradeTempChart.destroy();
-                        belgradeTempChart = new Chart(ctxTemp, {
+                        if (outsideTempChart) outsideTempChart.destroy();
+                        outsideTempChart = new Chart(ctxTemp, {
                             type: 'line',
                             data: {
                                 labels: labels,
                                 datasets: [{
-                                    label: 'Outside Temperature (C)',
+                                    label: 'Outside Temperature (24h)',
                                     data: tempData,
                                     borderColor: theme.temp,
                                     backgroundColor: toRgba(theme.temp, 0.12),
@@ -2966,7 +2803,7 @@ HTML_TEMPLATE = """
                         });
                     }
                 })
-                .catch(err => console.error('Belgrade air quality failed:', err));
+                .catch(err => console.error('Outside air quality failed:', err));
         }
 
         function loadSchedule() {
@@ -3546,13 +3383,6 @@ def index():
     return render_template_string(HTML_TEMPLATE, state=snap, page="purifier")
 
 
-@app.get("/camera")
-def camera():
-    """Camera dashboard placeholder"""
-    snap = snapshot_state()
-    return render_template_string(HTML_TEMPLATE, state=snap, page="camera")
-
-
 @app.get("/api/status")
 def api_status():
     """Get current status"""
@@ -3819,17 +3649,17 @@ def api_set_schedule():
     save_schedule()
     return jsonify(sleep_schedule)
 
-@app.get("/api/belgrade-aqi")
-def api_belgrade_aqi():
-    """Get Belgrade AQI"""
-    aqi_data = get_belgrade_aqi()
+@app.get("/api/outside-aqi")
+def api_outside_aqi():
+    """Get outside AQI for configured location"""
+    aqi_data = get_outside_aqi()
     return jsonify(aqi_data)
 
-@app.get("/api/belgrade-air-quality")
-def api_belgrade_air_quality():
-    """Get Belgrade air quality history"""
-    history = get_belgrade_air_quality_history()
-    return jsonify({"data": history})
+@app.get("/api/outside-air-quality")
+def api_outside_air_quality():
+    """Get outside air quality history for configured location"""
+    history = get_outside_air_quality_history()
+    return jsonify({"data": history, "city": AIR_QUALITY_CITY})
 
 @app.post("/api/set-selected-curve")
 def api_set_selected_curve():
